@@ -1,5 +1,8 @@
+use std::time::Duration;
 #[cfg(not(target_env = "msvc"))]
 use tikv_jemallocator::Jemalloc;
+use tokio::task;
+use tokio::time::sleep;
 use {
     anyhow::Context,
     clap::{Parser, Subcommand},
@@ -59,6 +62,7 @@ use {
     },
     yellowstone_shield_store::PolicyStore,
 };
+use yellowstone_jet::transactions::UpcomingLeaderSchedule;
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
@@ -291,6 +295,7 @@ async fn run_jet(config: ConfigJet) -> anyhow::Result<()> {
     )
     .await;
 
+
     let rooted_tx_geyser_rx = geyser
         .subscribe_transactions()
         .await
@@ -379,6 +384,34 @@ async fn run_jet(config: ConfigJet) -> anyhow::Result<()> {
 
     // Set up Lewis event tracking pipeline
     let (lewis_handler, lewis_fut) = create_lewis_pipeline(config.lewis_events.clone());
+
+    let debug_cluster_tpu_info = cluster_tpu_info.clone();
+    task::spawn(async move {
+
+        let mut last_printed_leader = None;
+        loop {
+            let current_slot = debug_cluster_tpu_info.get_current_slot();
+            let leader = debug_cluster_tpu_info.leader_lookahead(0);
+
+            let [next, ..] = leader[..] else {
+                // startup phase, no leader yet
+                warn!("No leader found");
+                sleep(Duration::from_millis(200)).await;
+                continue;
+            };
+
+            if Some(next) != last_printed_leader {
+                last_printed_leader = Some(next);
+                let current_slot = debug_cluster_tpu_info.get_current_slot();
+                let addr = debug_cluster_tpu_info.get_quic_tpu_socket_addr(next);
+                if let Some(addr) = addr {
+                    info!("Next leader: {} {:?}", current_slot, addr);
+                }
+            }
+
+            sleep(Duration::from_millis(20)).await;
+        }
+    });
 
     let mut tx_forwader = TransactionFanout::new(
         Arc::new(cluster_tpu_info.clone()),
